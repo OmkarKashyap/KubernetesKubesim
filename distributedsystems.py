@@ -3,155 +3,140 @@ import threading
 import time
 import subprocess
 import logging
-import argparse
+import sqlite3
 
 app = Flask(__name__)
-
 logging.basicConfig(level=logging.INFO)
 
-nodes = {}
-pods = []
+db_file = "cluster.db"
 lock = threading.Lock()
 
-def is_docker_running():
-    docker_check = subprocess.run("docker info", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return docker_check.returncode == 0
+# Initialize Database
+def init_db():
+    with sqlite3.connect(db_file) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS nodes (
+                node_id TEXT PRIMARY KEY,
+                cpu INTEGER,
+                last_heartbeat REAL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pods (
+                pod_id TEXT PRIMARY KEY,
+                cpu INTEGER,
+                node_id TEXT,
+                status TEXT DEFAULT 'pending',
+                FOREIGN KEY (node_id) REFERENCES nodes (node_id)
+            )
+        """)
+        conn.commit()
+init_db()
 
 def run_command(cmd):
-    if not is_docker_running():
-        logging.error(" Docker is not running! Please start Docker.")
-        return
-    
-    try:
-        subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Command failed: {cmd}\nError: {e.stderr.decode()}")
+    subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-def create_docker_container(node_id):
-    container_name = f"node_{node_id}"
-    
-    check_cmd = f"docker ps -a --filter 'name={container_name}' --format '{{{{.Names}}}}'"
-    existing_container = subprocess.run(check_cmd, shell=True, capture_output=True, text=True).stdout.strip()
-    
-    if existing_container:
-        logging.warning(f" Container '{container_name}' already exists. Removing it first...")
-        remove_docker_container(node_id)  
-
-    cmd = f"docker run -d --name {container_name} ubuntu sleep infinity"
-    run_command(cmd)
-
-def remove_docker_container(node_id):
-    cmd = f"docker rm -f node_{node_id}"
-    run_command(cmd)
-
-def heartbeat_checker():
+def auto_reschedule():
     while True:
-        time.sleep(10)
-        with lock:
-            for node_id, node in list(nodes.items()):
-                if time.time() - node['last_heartbeat'] > 30:
-                    logging.warning(f" Node {node_id} failed! Removing node and rescheduling pods...")
-                    failed_pods = node['pods'][:]
-                    del nodes[node_id]
-                    remove_docker_container(node_id)
-                    reschedule_pods(failed_pods)
+        time.sleep(15)
+        with sqlite3.connect(db_file) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT pod_id, cpu FROM pods WHERE node_id IS NULL")
+            failed_pods = cursor.fetchall()
+            for pod_id, cpu in failed_pods:
+                assigned_node = schedule_pod(pod_id, cpu)
+                if assigned_node:
+                    logging.info(f"Rescheduled pod {pod_id} to Node {assigned_node}")
 
-def reschedule_pods(failed_pods):
-    """Try to reschedule pods from a failed node."""
-    for pod_id, cpu_req in failed_pods:
-        assigned_node = schedule_pod(pod_id, cpu_req, algorithm="best-fit")
-        if assigned_node:
-            logging.info(f"Pod {pod_id} rescheduled to Node {assigned_node}")
-        else:
-            pods.append((pod_id, cpu_req))  
-
-def schedule_pod(pod_id, cpu_req, algorithm="first-fit"):
-    best_node = None
-    min_waste = float('inf')
-    max_waste = -float('inf')
-
-    with lock:
-        for node_id, node in nodes.items():
-            if node['cpu'] >= cpu_req:
-                waste = node['cpu'] - cpu_req
-                if algorithm == "first-fit":
-                    best_node = node_id
-                    break
-                elif algorithm == "best-fit" and waste < min_waste:
-                    min_waste = waste
-                    best_node = node_id
-                elif algorithm == "worst-fit" and waste > max_waste:
-                    max_waste = waste
-                    best_node = node_id
-    
-        if best_node:
-            nodes[best_node]['pods'].append((pod_id, cpu_req))
-            nodes[best_node]['cpu'] -= cpu_req
-            return best_node
-    return None
+def schedule_pod(pod_id, cpu_req):
+    with sqlite3.connect(db_file) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT node_id, cpu FROM nodes ORDER BY cpu DESC")
+        nodes = cursor.fetchall()
+        
+        for node_id, cpu in nodes:
+            if cpu >= cpu_req:
+                new_cpu = cpu - cpu_req
+                cursor.execute("UPDATE nodes SET cpu = ? WHERE node_id = ?", (new_cpu, node_id))
+                cursor.execute("UPDATE pods SET node_id = ?, status = 'running' WHERE pod_id = ?", (node_id, pod_id))
+                conn.commit()
+                return node_id
+        return None
 
 @app.route('/add_node', methods=['POST'])
 def add_node():
     data = request.json
-    node_id = data['node_id']
-    cpu = data['cpu']
+    node_id, cpu = data['node_id'], data['cpu']
+    with sqlite3.connect(db_file) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO nodes VALUES (?, ?, ?)", (node_id, cpu, time.time()))
+        conn.commit()
+    return jsonify({'message': f'Node {node_id} added'})
 
-    with lock:
-        if node_id in nodes:
-            return jsonify({'error': f'Node {node_id} already exists'}), 400
-
-        nodes[node_id] = {
-            'cpu': cpu,
-            'pods': [],
-            'last_heartbeat': time.time()
-        }
-
-    create_docker_container(node_id)
-    
-    return jsonify({'message': f' Node {node_id} added and Docker container launched'})
+@app.route('/launch_pod', methods=['POST'])
+def launch_pod():
+    data = request.json
+    pod_id, cpu_req = data['pod_id'], data['cpu']
+    with sqlite3.connect(db_file) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO pods (pod_id, cpu, node_id, status) VALUES (?, ?, NULL, 'pending')", (pod_id, cpu_req))
+        conn.commit()
+    assigned_node = schedule_pod(pod_id, cpu_req)
+    if assigned_node:
+        return jsonify({'message': f'Pod {pod_id} launched on Node {assigned_node}'})
+    return jsonify({'error': 'No available nodes, retrying in next cycle'}), 400
 
 @app.route('/heartbeat', methods=['POST'])
 def heartbeat():
     data = request.json
     node_id = data['node_id']
-    with lock:
-        if node_id in nodes:
-            nodes[node_id]['last_heartbeat'] = time.time()
-            return jsonify({'message': 'Heartbeat received'})
-    return jsonify({'error': ' Node not found'}), 404
-
-@app.route('/launch_pod', methods=['POST'])
-def launch_pod():
-    data = request.json
-    pod_id = data['pod_id']
-    cpu_req = data['cpu']
-    assigned_node = schedule_pod(pod_id, cpu_req, algorithm="best-fit")  
-    if assigned_node:
-        return jsonify({'message': f' Pod {pod_id} launched on Node {assigned_node}'})
-    return jsonify({'error': ' No available nodes'}), 400
+    with sqlite3.connect(db_file) as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE nodes SET last_heartbeat = ? WHERE node_id = ?", (time.time(), node_id))
+        conn.commit()
+    return jsonify({'message': 'Heartbeat received'})
 
 @app.route('/list_nodes', methods=['GET'])
 def list_nodes():
-    """Returns the list of nodes with their status (Healthy/Unhealthy)."""
-    with lock:
-        current_time = time.time()
-        node_statuses = {
-            node_id: {
-                'cpu': node['cpu'],
-                'pods': node['pods'],
-                'status': 'Healthy' if (current_time - node['last_heartbeat']) <= 30 else 'Unhealthy'
-            } for node_id, node in nodes.items()
-        }
-    return jsonify(node_statuses)
+    with sqlite3.connect(db_file) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT node_id, cpu, last_heartbeat FROM nodes")
+        node_list = cursor.fetchall()
+    return jsonify([{ 'node_id': node_id, 'cpu': cpu, 'last_heartbeat': last_heartbeat} for node_id, cpu, last_heartbeat in node_list])
+
+@app.route('/pod_usage', methods=['GET'])
+def pod_usage():
+    with sqlite3.connect(db_file) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT pod_id, cpu, node_id, status FROM pods")
+        pod_list = cursor.fetchall()
+    return jsonify([{ 'pod_id': pod_id, 'cpu': cpu, 'node_id': node_id, 'status': status} for pod_id, cpu, node_id, status in pod_list])
+
+def heartbeat_checker():
+    while True:
+        time.sleep(10)
+        with sqlite3.connect(db_file) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT node_id FROM nodes WHERE ? - last_heartbeat > 30", (time.time(),))
+            failed_nodes = cursor.fetchall()
+            for (node_id,) in failed_nodes:
+                logging.warning(f"Node {node_id} failed!")
+                cursor.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
+                cursor.execute("UPDATE pods SET node_id = NULL, status = 'pending' WHERE node_id = ?", (node_id,))
+            conn.commit()
 
 def auto_heartbeat():
     while True:
         time.sleep(5)
-        with lock:
-            for node_id in nodes.keys():
-                nodes[node_id]['last_heartbeat'] = time.time()
+        with sqlite3.connect(db_file) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE nodes SET last_heartbeat = ?", (time.time(),))
+            conn.commit()
+
+threading.Thread(target=heartbeat_checker, daemon=True).start()
+threading.Thread(target=auto_heartbeat, daemon=True).start()
+threading.Thread(target=auto_reschedule, daemon=True).start()
 
 if __name__ == '__main__':
-    threading.Thread(target=heartbeat_checker, daemon=True).start()
-    threading.Thread(target=auto_heartbeat, daemon=True).start()
     app.run(host='0.0.0.0', port=5001, debug=True)
