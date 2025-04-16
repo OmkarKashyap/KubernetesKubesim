@@ -1,3 +1,27 @@
+flask
+
+Build and run the docker container:
+
+Build the image
+docker build -t distributed-system-sim .
+
+Run the container
+docker run -d -p 5001:5001 --name ds-cluster distributed-system-sim
+
+
+Rebuild and reset easily
+
+docker rm -f ds-cluster
+docker build -t distributed-system-sim .
+docker run -d -p 5001:5001 --name ds-cluster distributed-system-sim
+
+Volume Binding
+-v $(pwd)/cluster.db:/app/cluster.db
+
+docker run -d -p 5001:5001 -v $(pwd)/cluster.db:/app/cluster.db --name ds-cluster distributed-system-sim
+
+
+
 # KubernetesKubesim
 Run The Main File :- python3 distributedsystems.py 
 
@@ -7,7 +31,7 @@ List Nodes
 
 List nodes with CLI.PY :-  python3 cli.py --list-nodes
  
-List nodes with curl :- curl -X GET http://127.0.0.1:5001/get_nodes
+List nodes with curl :- curl -X GET http://127.0.0.1:5001/list_nodes
 
 
 
@@ -45,28 +69,15 @@ python3 cli.py --list-pods
 curl http://127.0.0.1:5001/pod_usage
 
 
+# Simulate node failure
+python3 cli.py --fail-node node1
 
-Detect Failed Nodes:
-
-sqlite3 cluster.db "SELECT node_id, last_heartbeat FROM nodes WHERE ? - last_heartbeat > 30"
-
-Flag Node as Failed:
+# Recover failed node
+python3 cli.py --recover-node node1
 
 
-sqlite3 cluster.db "UPDATE nodes SET status = 'failed' WHERE node_id IN (SELECT node_id FROM nodes WHERE ? - last_heartbeat > 30)"
 
-Find Unhealthy Pods on Failed Node:
 
-sqlite3 cluster.db "SELECT pod_id FROM pods WHERE node_id = 'failed_node_id' AND status = 'unhealthy'"
-
-Reschedule Pods to Healthy Nodes:
-
-sqlite3 cluster.db "UPDATE pods SET node_id = 1, status = 'healthy' WHERE pod_id = 2"
-
-Log Actions
-
-echo "Node failed: 'failed_node_id' at $(date)" >> recovery.log
-echo "Pod 'pod_id' rescheduled to 'healthy_node_id' at $(date)" >> recovery.log
 
 
 
