@@ -8,6 +8,10 @@ docker build -t distributed-system-sim .
 Run the container
 docker run -d -p 5001:5001 --name ds-cluster distributed-system-sim
 
+Run Command
+docker run -it --rm -p 5001:5001 distributed-system-sim
+
+
 
 Rebuild and reset easily
 
@@ -46,7 +50,8 @@ Add nodes with curl:- curl -X POST http://127.0.0.1:5001/add_node -H "Content-Ty
 
 Send Heartbeat (To Prevent Failure)
 
-Heartbeat with curl:- curl -X POST http://127.0.0.1:5001/heartbeat -H "Content-Type: application/json" -d '{"node_id": "node1"}'
+Heartbeat with curl:- 
+curl -X POST http://127.0.0.1:5001/heartbeat -H "Content-Type: application/json" -d '{"node_id": "node1"}'
 
 You can simulate automatic heartbeats externally using a simple watch or loop script:
 
