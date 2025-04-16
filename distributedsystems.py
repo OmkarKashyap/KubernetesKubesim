@@ -15,23 +15,41 @@ lock = threading.Lock()
 def init_db():
     with sqlite3.connect(db_file) as conn:
         cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS nodes (
-                node_id TEXT PRIMARY KEY,
-                cpu INTEGER,
-                last_heartbeat REAL
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS pods (
-                pod_id TEXT PRIMARY KEY,
-                cpu INTEGER,
-                node_id TEXT,
-                status TEXT DEFAULT 'pending',
-                FOREIGN KEY (node_id) REFERENCES nodes (node_id)
-            )
-        """)
+        
+        # Check if the 'status' column exists in the 'nodes' table
+        cursor.execute("PRAGMA table_info(nodes)")
+        columns = cursor.fetchall()
+        
+        # If 'status' column doesn't exist, recreate the table
+        if not any(col[1] == 'status' for col in columns):
+            logging.info("Adding 'status' column to 'nodes' table...")
+            # Drop the old table
+            cursor.execute("DROP TABLE IF EXISTS nodes")
+            cursor.execute("""
+                CREATE TABLE nodes (
+                    node_id TEXT PRIMARY KEY,
+                    cpu INTEGER,
+                    last_heartbeat REAL,
+                    status TEXT DEFAULT 'healthy'
+                )
+            """)
+        
+        # Check if 'pods' table exists, if not create it
+        cursor.execute("PRAGMA table_info(pods)")
+        pod_columns = cursor.fetchall()
+        if not pod_columns:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS pods (
+                    pod_id TEXT PRIMARY KEY,
+                    cpu INTEGER,
+                    node_id TEXT,
+                    status TEXT DEFAULT 'pending',
+                    FOREIGN KEY (node_id) REFERENCES nodes (node_id)
+                )
+            """)
+        
         conn.commit()
+
 init_db()
 
 def run_command(cmd):
@@ -52,13 +70,13 @@ def auto_reschedule():
 def schedule_pod(pod_id, cpu_req):
     with sqlite3.connect(db_file) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT node_id, cpu FROM nodes ORDER BY cpu DESC")
+        cursor.execute("SELECT node_id, cpu, status FROM nodes WHERE status = 'healthy' ORDER BY cpu DESC")
         nodes = cursor.fetchall()
         
-        for node_id, cpu in nodes:
+        for node_id, cpu, status in nodes:
             if cpu >= cpu_req:
                 new_cpu = cpu - cpu_req
-                cursor.execute("UPDATE nodes SET cpu = ? WHERE node_id = ?", (new_cpu, node_id))
+                cursor.execute("UPDATE nodes SET cpu = ?, status = ? WHERE node_id = ?", (new_cpu, status, node_id))
                 cursor.execute("UPDATE pods SET node_id = ?, status = 'running' WHERE pod_id = ?", (node_id, pod_id))
                 conn.commit()
                 return node_id
@@ -70,22 +88,49 @@ def add_node():
     node_id, cpu = data['node_id'], data['cpu']
     with sqlite3.connect(db_file) as conn:
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO nodes VALUES (?, ?, ?)", (node_id, cpu, time.time()))
+        cursor.execute("INSERT INTO nodes VALUES (?, ?, ?, 'healthy')", (node_id, cpu, time.time()))
         conn.commit()
     return jsonify({'message': f'Node {node_id} added'})
 
 @app.route('/launch_pod', methods=['POST'])
 def launch_pod():
     data = request.json
-    pod_id, cpu_req = data['pod_id'], data['cpu']
+    pod_id = data['pod_id']
+    cpu_req = data['cpu']
+
     with sqlite3.connect(db_file) as conn:
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO pods (pod_id, cpu, node_id, status) VALUES (?, ?, NULL, 'pending')", (pod_id, cpu_req))
+
+        # Check if the pod already exists
+        cursor.execute("SELECT 1 FROM pods WHERE pod_id = ?", (pod_id,))
+        if cursor.fetchone():
+            return jsonify({'error': f'Pod {pod_id} already exists'}), 400
+
+        # Verify total available CPU in healthy nodes
+        current_time = time.time()
+        cursor.execute("""
+            SELECT SUM(cpu) FROM nodes WHERE ? - last_heartbeat <= 30
+        """, (current_time,))
+        total_available_cpu = cursor.fetchone()[0] or 0
+
+        if total_available_cpu < cpu_req:
+            return jsonify({'error': 'Insufficient cluster-wide resources to schedule pod'}), 400
+
+        # Insert pod as pending before attempting scheduling
+        cursor.execute("""
+            INSERT INTO pods (pod_id, cpu, node_id, status)
+            VALUES (?, ?, NULL, 'pending')
+        """, (pod_id, cpu_req))
         conn.commit()
+
+    # Try to schedule to a specific node
     assigned_node = schedule_pod(pod_id, cpu_req)
     if assigned_node:
         return jsonify({'message': f'Pod {pod_id} launched on Node {assigned_node}'})
-    return jsonify({'error': 'No available nodes, retrying in next cycle'}), 400
+    else:
+        return jsonify({'error': 'No single node has enough resources right now, retrying in next cycle'}), 400
+
+
 
 @app.route('/heartbeat', methods=['POST'])
 def heartbeat():
@@ -93,7 +138,7 @@ def heartbeat():
     node_id = data['node_id']
     with sqlite3.connect(db_file) as conn:
         cursor = conn.cursor()
-        cursor.execute("UPDATE nodes SET last_heartbeat = ? WHERE node_id = ?", (time.time(), node_id))
+        cursor.execute("UPDATE nodes SET last_heartbeat = ?, status = 'healthy' WHERE node_id = ?", (time.time(), node_id))
         conn.commit()
     return jsonify({'message': 'Heartbeat received'})
 
@@ -101,9 +146,9 @@ def heartbeat():
 def list_nodes():
     with sqlite3.connect(db_file) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT node_id, cpu, last_heartbeat FROM nodes")
+        cursor.execute("SELECT node_id, cpu, last_heartbeat, status FROM nodes")
         node_list = cursor.fetchall()
-    return jsonify([{ 'node_id': node_id, 'cpu': cpu, 'last_heartbeat': last_heartbeat} for node_id, cpu, last_heartbeat in node_list])
+    return jsonify([{ 'node_id': node_id, 'cpu': cpu, 'last_heartbeat': last_heartbeat, 'status': status} for node_id, cpu, last_heartbeat, status in node_list])
 
 @app.route('/pod_usage', methods=['GET'])
 def pod_usage():
@@ -122,7 +167,7 @@ def heartbeat_checker():
             failed_nodes = cursor.fetchall()
             for (node_id,) in failed_nodes:
                 logging.warning(f"Node {node_id} failed!")
-                cursor.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
+                cursor.execute("UPDATE nodes SET status = 'unhealthy' WHERE node_id = ?", (node_id,))
                 cursor.execute("UPDATE pods SET node_id = NULL, status = 'pending' WHERE node_id = ?", (node_id,))
             conn.commit()
 
